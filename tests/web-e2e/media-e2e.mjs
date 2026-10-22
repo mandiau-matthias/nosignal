@@ -1,11 +1,17 @@
 // Incoming media (GIF / sticker / photo) from the other side, real server (see start script in tasks), two browser contexts.
 import { coolDown, launch, makeRun, fresh, goto, signup, startChatWith, openChatRow, sleep, tag } from './lib.mjs';
+import { mkdtempSync } from 'node:fs';
 const BASE = process.env.BASE ?? 'https://127.0.0.1:3105';
 const FX = new URL('./fixtures/', import.meta.url).pathname;
 const run = makeRun('media');
 const t = tag(); const NA = `ma${t}`; const NB = `mb${t}`;
 const browser = await launch();
+let tempDir;
 try {
+  tempDir = mkdtempSync(`${process.env.HOME}/tel-e2e-`);
+  const photoPath = `${tempDir}/photo.png`;
+  const { readFileSync, copyFileSync } = await import('node:fs');
+  copyFileSync(FX + 'photo.png', photoPath);
   const A = await fresh(browser, 'A'); await goto(A, BASE); await signup(A, NA);
   const B = await fresh(browser, 'B'); await goto(B, BASE); await signup(B, NB);
   await startChatWith(A, NB);
@@ -17,14 +23,14 @@ try {
       const fd = new FormData(); fd.append('file', new File([bin], 'pack.zip', { type: 'application/zip' }));
       const a = await fetch('/api/media/packs/import', { method: 'POST', body: fd, credentials: 'include' });
       return a.status;
-    }, (await import('node:fs')).readFileSync(FX + 'tgs-pack.zip').toString('base64'));
+    }, readFileSync(FX + 'tgs-pack.zip').toString('base64'));
     const g = await page.evaluate(async (b64) => {
       const bin = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
       const fd = new FormData(); fd.append('file', new File([bin], 't.gif', { type: 'image/gif' }));
       const a = await fetch('/api/media/gifs/upload', { method: 'POST', body: fd, credentials: 'include' });
       const j = await a.json().catch(() => ({})); if (a.status === 201) await fetch(`/api/media/gifs/${j.id}/save`, { method: 'PUT', credentials: 'include' });
       return a.status;
-    }, (await import('node:fs')).readFileSync(FX + 't.gif').toString('base64'));
+    }, readFileSync(FX + 't.gif').toString('base64'));
     console.log(who, 'pack import', r, 'gif upload', g);
   }
   await A.reload({ waitUntil: 'networkidle2' }); await B.reload({ waitUntil: 'networkidle2' });
@@ -45,7 +51,7 @@ try {
   await A.click('.sticker-grid button'); await sleep(3000);
   // photo from A
   const inputs = await A.$$('input.composer__file');
-  await inputs[1].uploadFile(FX + 'photo.png'); await sleep(2000);
+  await inputs[1].uploadFile(photoPath); await sleep(2000);
   await A.screenshot({ path: run.shots + '/A-after.png' });
   await sleep(6000);
   await B.screenshot({ path: run.shots + '/B-live.png' });
@@ -69,5 +75,11 @@ try {
   const csp = await B.evaluate(async () => (await fetch('/')).headers.get('content-security-policy') ?? '');
   run.check('CSP allows blob: for img/media/connect (decrypted media is shown from blob URLs)', /img-src[^;]*blob:/.test(csp) && /media-src[^;]*blob:/.test(csp) && /connect-src[^;]*blob:/.test(csp), csp.slice(0, 200));
 } catch (e) { console.log('ERROR', e); run.fail(); }
-finally { await browser.close(); }
+finally {
+  if (tempDir) {
+    const { rmSync } = await import('node:fs');
+    rmSync(tempDir, { recursive: true, force: true });
+  }
+  await browser.close();
+}
 run.done();
