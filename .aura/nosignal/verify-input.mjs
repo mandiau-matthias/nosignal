@@ -1,0 +1,21 @@
+// Trusted driver. Inspect source as data; never import a candidate module here.
+import { execFileSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+const BASE='91f81bf89f892bcf2cad804a2a1fe14a12aa7e9f';
+const paths=['tests/backup/kb1-e2e.mjs','tests/groups-web/gr2-e2e.mjs','tests/web-e2e/media-e2e.mjs'];
+const git=(dir,args)=>execFileSync('git',['-C',dir,...args],{encoding:'utf8',maxBuffer:8388608}).trim();
+const fail=(ok,s)=>{if(!ok)throw Error(s);};
+const target=process.env.TARGET_SHA, artifactHash=process.env.ARTIFACT_HASH;
+fail(/^[a-f0-9]{40}$/.test(target)&&/^[a-f0-9]{64}$/.test(artifactHash),'Invalid input');
+fail(git('source',['rev-parse','HEAD'])===target&&git('baseline',['rev-parse','HEAD'])===BASE,'Wrong checkout');
+const inventory=dir=>new Map(git(dir,['ls-tree','-r','HEAD']).split('\n').map(l=>{const[m,p]=l.split('\t');fail(p&&!p.split('/').includes('.git'),'Bad path');return[p,m];}));
+const src=inventory('source'), before=inventory('baseline');
+fail(src.size===before.size,'Tree size changed');
+for(const[p,m]of before)fail(src.has(p)&&(paths.includes(p)?src.get(p).startsWith('100644 blob '):src.get(p)===m),'Unexpected change: '+p);
+const files=paths.map(path=>({path,before:readFileSync('baseline/'+path,'utf8'),after:readFileSync('source/'+path,'utf8')}));
+fail(files.every(f=>f.before!==f.after)&&Buffer.byteLength(JSON.stringify(files))<=131072,'Patch scope');
+fail(createHash('sha256').update(JSON.stringify(files)).digest('hex')===artifactHash,'Artifact hash mismatch');
+const lock=JSON.parse(readFileSync('source/package-lock.json','utf8'));
+for(const item of Object.values(lock.packages??{}))if(item.resolved&&!item.link)fail(item.resolved.startsWith('https://registry.npmjs.org/')&&typeof item.integrity==='string','Unreviewed dependency destination');
+console.log('Verified exact three-file artifact',target,artifactHash);

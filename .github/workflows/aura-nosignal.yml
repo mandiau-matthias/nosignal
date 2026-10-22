@@ -1,0 +1,90 @@
+name: Aura nosignal isolated validation
+run-name: Aura nosignal ${{ inputs.target_sha }} ${{ inputs.artifact_hash }}
+on:
+  workflow_dispatch:
+    inputs:
+      target_sha:
+        required: true
+        type: string
+      artifact_hash:
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: aura-nosignal-validation
+  cancel-in-progress: false
+jobs:
+  validate:
+    name: aura-nosignal
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      TARGET_SHA: ${{ inputs.target_sha }}
+      ARTIFACT_HASH: ${{ inputs.artifact_hash }}
+    steps:
+      - name: Validate inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$TARGET_SHA" =~ ^[a-f0-9]{40}$ ]]
+          [[ "$ARTIFACT_HASH" =~ ^[a-f0-9]{64}$ ]]
+      - name: Checkout control
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          path: trusted
+          persist-credentials: false
+          fetch-depth: 1
+          submodules: false
+          lfs: false
+      - name: Checkout target
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: mandiau-matthias/nosignal
+          ref: ${{ inputs.target_sha }}
+          path: source
+          persist-credentials: false
+          fetch-depth: 1
+          submodules: false
+          lfs: false
+      - name: Checkout baseline
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: DragonCuds/nosignal
+          ref: 91f81bf89f892bcf2cad804a2a1fe14a12aa7e9f
+          path: baseline
+          persist-credentials: false
+          fetch-depth: 1
+          submodules: false
+          lfs: false
+      - name: Verify exact artifact
+        shell: bash
+        run: node trusted/.aura/nosignal/verify-input.mjs
+      - name: Build isolated test image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build --no-cache --pull -t aura-nosignal-test trusted/.aura/nosignal
+          docker image inspect aura-nosignal-test --format '{{.Id}}'
+      - name: Install locked dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker volume create aura-nosignal-work
+          docker run --rm --cap-drop ALL --security-opt no-new-privileges --pids-limit 256 --memory 6g --cpus 2 --read-only --tmpfs /tmp:rw,nosuid,size=512m --mount type=bind,source="$GITHUB_WORKSPACE/source",target=/source,readonly --mount type=volume,source=aura-nosignal-work,target=/work --workdir /work aura-nosignal-test env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=/tmp sh -c 'cp -a --no-preserve=ownership /source/. /work/ && find /work -name .git -prune -exec rm -rf {} + && npm ci --ignore-scripts --no-audit --no-fund --cache /tmp/npm && chmod -R a+rwX /work'
+      - name: Build and test offline
+        shell: bash
+        run: |
+          set -euo pipefail
+          marker="$(cat /proc/sys/kernel/random/uuid)"
+          echo "::stop-commands::$marker"
+          docker run --rm --network none --user 1000:1000 --cap-drop ALL --security-opt no-new-privileges --pids-limit 512 --memory 6g --cpus 2 --shm-size 512m --read-only --tmpfs /tmp:rw,nosuid,size=1g,mode=1777 --mount type=volume,source=aura-nosignal-work,target=/work --mount type=bind,source="$GITHUB_WORKSPACE/source/tests",target=/work/tests,readonly --mount type=bind,source="$GITHUB_WORKSPACE/trusted/.aura/nosignal/checks.mjs",target=/checks.mjs,readonly --workdir /work aura-nosignal-test env -i PATH=/work/node_modules/.bin:/usr/local/bin:/usr/bin:/bin HOME=/tmp/aura-home CI=true node /checks.mjs
+          echo "::$marker::"
+      - name: Verify source unchanged
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C source rev-parse HEAD)" = "$TARGET_SHA"
+          git -C source diff --exit-code HEAD -- .
+          test -z "$(git -C source ls-files --others --exclude-standard)"
