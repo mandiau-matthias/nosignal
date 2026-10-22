@@ -18,7 +18,7 @@ jobs:
   validate:
     name: aura-nosignal
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 17
     env:
       TARGET_SHA: ${{ inputs.target_sha }}
       ARTIFACT_HASH: ${{ inputs.artifact_hash }}
