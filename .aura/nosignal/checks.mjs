@@ -10,7 +10,10 @@ run(['npm','rebuild','argon2','better-sqlite3','--offline','--build-from-source'
 run(['npm','run','build'],common,180000);
 const security=readdirSync('/work/tests/security').filter(n=>n.endsWith('.test.mjs')).sort().map(n=>'tests/security/'+n);
 if(!security.length)throw Error('No security tests');
-run(['node','--test',...security],common,180000);
+// The upstream suite compares real password-hash timings. Run files serially
+// so unrelated CPU-heavy tests do not compete under the two-CPU container quota.
+// Keep every upstream assertion and test file unchanged.
+run(['node','--test','--test-concurrency=1',...security],common,180000);
 const ready=()=>new Promise(resolve=>{const r=https.get('https://127.0.0.1:3068/',{rejectUnauthorized:false,timeout:1000},res=>{res.resume();resolve(res.statusCode===200);});r.on('error',()=>resolve(false));r.on('timeout',()=>r.destroy());});
 // Keep diagnostic metadata across the whole run, without printing request bodies,
 // headers, cookies, query strings, backup blobs, or generated account secrets.
