@@ -15,64 +15,94 @@ concurrency:
   group: aura-nosignal-validation
   cancel-in-progress: false
 jobs:
-  diagnostic:
-    name: aura-nosignal-network-diagnostic
+  validate:
+    name: aura-nosignal
     runs-on: ubuntu-24.04
-    timeout-minutes: 1
+    timeout-minutes: 4
     env:
       TARGET_SHA: ${{ inputs.target_sha }}
       ARTIFACT_HASH: ${{ inputs.artifact_hash }}
     steps:
-      - name: Measure isolated browser connectivity
+      - name: Validate inputs
         shell: bash
         run: |
           set -euo pipefail
           [[ "$TARGET_SHA" =~ ^[a-f0-9]{40}$ ]]
           [[ "$ARTIFACT_HASH" =~ ^[a-f0-9]{64}$ ]]
-          test -x /opt/google/chrome/chrome
-          /opt/google/chrome/chrome --version
-          probe_script="$(mktemp /tmp/aura-network-probe.XXXXXX)"
-          trap 'rm -f "$probe_script"' EXIT
-          cat > "$probe_script" <<'PROBE_SCRIPT'
-          #!/usr/bin/env bash
-          # Trusted test-environment probe only. No repository code is executed.
+      - name: Checkout control
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          path: trusted
+          persist-credentials: false
+          fetch-depth: 1
+          submodules: false
+          lfs: false
+      - name: Checkout target
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: mandiau-matthias/nosignal
+          ref: ${{ inputs.target_sha }}
+          path: source
+          persist-credentials: false
+          fetch-depth: 1
+          submodules: false
+          lfs: false
+      - name: Checkout baseline
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: DragonCuds/nosignal
+          ref: 91f81bf89f892bcf2cad804a2a1fe14a12aa7e9f
+          path: baseline
+          persist-credentials: false
+          fetch-depth: 1
+          submodules: false
+          lfs: false
+      - name: Verify exact artifact
+        shell: bash
+        run: node trusted/.aura/nosignal/verify-input.mjs
+      - name: Build isolated test image
+        shell: bash
+        run: |
           set -euo pipefail
-          worker_uid="$1"
-          worker_gid="$2"
-          chrome="$3"
-          [[ "$worker_uid" =~ ^[1-9][0-9]*$ && "$worker_gid" =~ ^[1-9][0-9]*$ ]]
-          [[ "$chrome" == /opt/google/chrome/chrome ]]
-          ip link set lo up
-          probe_home="$(mktemp -d /tmp/aura-online-probe.XXXXXX)"
-          trap 'rm -rf "$probe_home"' EXIT
-          chown "$worker_uid:$worker_gid" "$probe_home"
-          probe() {
-            local phase="$1"
-            local result
-            result="$(setpriv --reuid "$worker_uid" --regid "$worker_gid" --clear-groups --no-new-privs env -i PATH=/usr/bin:/bin HOME="$probe_home" timeout 10s "$chrome" --headless=new --no-sandbox --disable-gpu --disable-background-networking --disable-component-update --no-first-run --no-default-browser-check --user-data-dir="$probe_home/$phase" --dump-dom 'data:text/html,<body><script>document.write("AURA_ONLINE_"+navigator.onLine)</script></body>' 2>/dev/null)"
-            if [[ "$result" == *'>AURA_ONLINE_true<'* ]]; then
-              printf 'AURA_BROWSER_STATE {"phase":"%s","online":true}\n' "$phase"
-            elif [[ "$result" == *'>AURA_ONLINE_false<'* ]]; then
-              printf 'AURA_BROWSER_STATE {"phase":"%s","online":false}\n' "$phase"
-            else
-              echo 'AURA_PROBE_INVALID_BROWSER_OUTPUT' >&2
-              exit 1
-            fi
-          }
-          probe loopback_only
-          # This interface has no peer, bridge, gateway or path outside this namespace.
-          ip link add aura0 type dummy
-          ip address add 192.0.2.1/32 dev aura0 noprefixroute
-          ip link set aura0 up
-          ip -j -d link show | jq -e 'length == 2 and ([.[].ifname] | sort) == ["aura0","lo"] and ([.[] | select(.ifname == "aura0")][0].linkinfo.info_kind == "dummy")' >/dev/null
-          ip -j route show table main | jq -e 'length == 0' >/dev/null
-          ip -j -6 route show table main | jq -e 'all(.[]; .dst != "default" and .dev == "aura0" and (.dst | startswith("fe80:")))' >/dev/null
-          if ip route get 1.1.1.1 >/dev/null 2>&1 || ip route get 172.17.0.1 >/dev/null 2>&1 || ip -6 route get 2606:4700:4700::1111 >/dev/null 2>&1; then
-            echo 'AURA_PROBE_UNEXPECTED_ROUTE' >&2
+          docker build --no-cache --pull -t aura-nosignal-test trusted/.aura/nosignal
+          docker image inspect aura-nosignal-test --format '{{.Id}}'
+      - name: Install locked dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker volume create aura-nosignal-work
+          docker run --rm --cap-drop ALL --security-opt no-new-privileges --pids-limit 256 --memory 6g --cpus 2 --read-only --tmpfs /tmp:rw,nosuid,size=512m --mount type=bind,source="$GITHUB_WORKSPACE/source",target=/source,readonly --mount type=volume,source=aura-nosignal-work,target=/work --workdir /work aura-nosignal-test env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=/tmp sh -c 'cp -a --no-preserve=ownership /source/. /work/ && find /work -name .git -prune -exec rm -rf {} + && npm ci --ignore-scripts --no-audit --no-fund --cache /tmp/npm && chmod -R a+rwX /work'
+      - name: Build and test offline
+        shell: bash
+        run: |
+          set -euo pipefail
+          marker="$(cat /proc/sys/kernel/random/uuid)"
+          echo "::stop-commands::$marker"
+          # Add an interface wholly inside the container namespace. No veth,
+          # bridge, peer, host route or default route exists; tests get no NET_ADMIN.
+          trap 'docker rm -f aura-nosignal-validation >/dev/null 2>&1 || true' EXIT
+          docker run -d --rm --name aura-nosignal-validation --network none --user 1000:1000 --cap-drop ALL --security-opt no-new-privileges --pids-limit 512 --memory 6g --cpus 4 --shm-size 512m --read-only --tmpfs /tmp:rw,nosuid,size=1g,mode=1777 --mount type=volume,source=aura-nosignal-work,target=/work --mount type=bind,source="$GITHUB_WORKSPACE/source/tests",target=/work/tests,readonly --mount type=bind,source="$GITHUB_WORKSPACE/trusted/.aura/nosignal/checks.mjs",target=/checks.mjs,readonly --workdir /work aura-nosignal-test /bin/sleep 300
+          pid="$(docker inspect --format '{{.State.Pid}}' aura-nosignal-validation)"
+          [[ "$pid" =~ ^[1-9][0-9]*$ ]]
+          test "$(readlink /proc/self/ns/net)" != "$(sudo -n readlink /proc/$pid/ns/net)"
+          sudo -n nsenter --target "$pid" --net -- ip link add aura0 type dummy
+          sudo -n nsenter --target "$pid" --net -- ip address add 192.0.2.1/32 dev aura0 noprefixroute
+          sudo -n nsenter --target "$pid" --net -- ip link set aura0 up
+          sudo -n nsenter --target "$pid" --net -- ip -j -d link show | jq -e 'length == 2 and ([.[].ifname] | sort) == ["aura0","lo"] and ([.[] | select(.ifname == "aura0")][0].linkinfo.info_kind == "dummy")' >/dev/null
+          sudo -n nsenter --target "$pid" --net -- ip -j route show table main | jq -e 'length == 0' >/dev/null
+          sudo -n nsenter --target "$pid" --net -- ip -j -6 route show table main | jq -e 'all(.[]; .dst != "default" and .dev == "aura0" and (.dst | startswith("fe80:")))' >/dev/null
+          if sudo -n nsenter --target "$pid" --net -- ip route get 1.1.1.1 >/dev/null 2>&1 || sudo -n nsenter --target "$pid" --net -- ip route get 172.17.0.1 >/dev/null 2>&1 || sudo -n nsenter --target "$pid" --net -- ip -6 route get 2606:4700:4700::1111 >/dev/null 2>&1; then
+            echo 'Unexpected external route' >&2
             exit 1
           fi
-          printf 'AURA_NETWORK_ISOLATION {"externalRoute":false,"hostRoute":false,"dummyHasPeer":false}\n'
-          probe isolated_dummy
-          PROBE_SCRIPT
-          chmod 444 "$probe_script"
-          sudo -n systemd-run --scope --quiet -p MemoryMax=6G -p CPUQuota=400% /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin /usr/bin/timeout 35s /usr/bin/unshare --net /usr/bin/bash "$probe_script" "$(id -u)" "$(id -g)" /opt/google/chrome/chrome
+          echo 'AURA_NETWORK_ISOLATION: dummy interface only; no external or host route'
+          docker exec aura-nosignal-validation env -i PATH=/work/node_modules/.bin:/usr/local/bin:/usr/bin:/bin HOME=/tmp/aura-home CI=true node /checks.mjs
+          echo "::$marker::"
+      - name: Verify source unchanged
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C source rev-parse HEAD)" = "$TARGET_SHA"
+          git -C source diff --exit-code HEAD -- .
+          test -z "$(git -C source ls-files --others --exclude-standard)"
